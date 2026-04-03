@@ -255,64 +255,53 @@ void TestPrint(void *priv)
 #endif // UART
 
 #if ADC
-#define ADC_MAX        1023.0f
-#define ADC_REF        3.3f
 
-#define VOLT_SCALE     (5.0f / 2.5f)   // divider compensation
-
-#define SPEED_SCALE    12.0f           // 5V -> 60 m/s
-#define ANGLE_SCALE    72.0f           // 5V -> 360 deg
-
-#define LPF_ALPHA      0.1f            // ~0.5s smoothing @10Hz
+const float LPF_ALPHA = 1.0f;   // fast response for 1 Hz data
 
 float speed_offset = 0.0f;
 float dir_offset   = 0.0f;
 
-float speed_filt = 0.0f;
+static float speed_filt = 0.0f;
+static float angle_filt = 0.0f;
+static int initialized = 0;
 
-// circular filter
-float dir_x = 1.0f;
-float dir_y = 0.0f;
+void compute_wind(uint16_t adc_speed_mv, uint16_t adc_dir_mv, float *speed,float *angle){
+    // --- Convert ADC → voltage ---
+    float v_speed = (adc_speed_mv / 1000.0f) * 2.0f;
+    float v_dir   = (adc_dir_mv   / 1000.0f) * 2.0f;
 
-float adc_to_voltage(u16 adc)
-{
-    float v = (adc / ADC_MAX) * ADC_REF;
-    return v * VOLT_SCALE;
-}
-void compute_wind(u16 adc_speed, u16 adc_dir, float *speed, float *angle)
-{
-    float v_speed = adc_to_voltage(adc_speed);
-    float v_dir   = adc_to_voltage(adc_dir);
+    // --- Physical values ---
+    float speed_raw = v_speed * 12.0f;
+    if (speed_raw < 0) speed_raw = 0;
 
-    // --- speed ---
-    float s = v_speed * SPEED_SCALE;
-    s -= speed_offset;
-    if (s < 0) s = 0;
+    float angle_raw = v_dir * 72.0f;
 
-    // LPF
-    speed_filt += LPF_ALPHA * (s - speed_filt);
+    while (angle_raw < 0)      angle_raw += 360.0f;
+    while (angle_raw >= 360.0f) angle_raw -= 360.0f;
 
-    // --- angle ---
-    float a = v_dir * ANGLE_SCALE;
+    // --- Init ---
+    if (!initialized) {
+        speed_filt = speed_raw;
+        angle_filt = angle_raw;
+        initialized = 1;
+    }
 
-    // apply offset
-    a -= dir_offset;
-    if (a < 0) a += 360;
-    if (a >= 360) a -= 360;
+    // --- SPEED LPF ---
+    speed_filt += LPF_ALPHA * (speed_raw - speed_filt);
 
-    // circular filtering
-    float rad = a * 3.1415926f / 180.0f;
-    float x = cosf(rad);
-    float y = sinf(rad);
+    // --- ANGLE unwrap + LPF ---
+    float delta = angle_raw - angle_filt;
 
-    dir_x += LPF_ALPHA * (x - dir_x);
-    dir_y += LPF_ALPHA * (y - dir_y);
+    if (delta > 180.0f)  delta -= 360.0f;
+    if (delta < -180.0f) delta += 360.0f;
 
-    float a_filt = atan2f(dir_y, dir_x) * 180.0f / 3.1415926f;
-    if (a_filt < 0) a_filt += 360;
+    angle_filt += LPF_ALPHA * delta;
+
+    if (angle_filt < 0.0f)      angle_filt += 360.0f;
+    if (angle_filt >= 360.0f)   angle_filt -= 360.0f;
 
     *speed = speed_filt;
-    *angle = a_filt;
+    *angle = angle_filt;
 }
 
 
@@ -324,8 +313,9 @@ void initUSB_ADC(){
     gpio_set_direction(IO_PORT_DM, 1); gpio_set_direction(IO_PORT_DP, 1);
 }
 
-void build_packet(uint8_t *buf, float speed, float angle)
-{
+u16 adc_dir, adc_speed;
+//void build_packet(uint8_t *buf, float speed, float angle)
+build_packet(u8 *buf, float speed, float angle, u16 adc_speed, u16 adc_dir){
     u16 s = (u16)(speed * 100.0f);
     u16 a = (u16)(angle * 100.0f);
 
@@ -338,24 +328,35 @@ void build_packet(uint8_t *buf, float speed, float angle)
     buf[4] = a >> 8;
     buf[5] = a & 0xFF;
 
+    // --- raw ADC data ---
+    buf[6] = adc_speed >> 8;
+    buf[7] = adc_speed & 0xFF;
+
+    buf[8] = adc_dir >> 8;
+    buf[9] = adc_dir & 0xFF;
+
     u8 cs = 0;
-    for (int i = 0; i < 6; i++) cs ^= buf[i];
-    buf[6] = cs;
+    for (int i = 0; i < 10; i++) cs ^= buf[i];
+    buf[10] = cs;
 }
 
+const packLen=11;
+
 void readWindADC(){
-    u8 packet[7];
+    //u8 packet[11];
+    u8 packet[packLen];
     u16 adc_dir    = adc_get_voltage(AD_CH_DM0);
     u16 adc_speed  = adc_get_voltage(AD_CH_DP0);
 
     float speed, angle;
     compute_wind(adc_speed, adc_dir, &speed, &angle);
-    build_packet(packet, speed, angle);
+    //build_packet(packet, speed, angle);
+    build_packet(packet, speed, angle, adc_speed, adc_dir);
 
     //ble_notify(packet, 7);
     if (trans_con_handle && g_ble_notify_enabled) {
         // Fixed Macro Names (Removed spaces)
-        int ret = ble_comm_att_send_data(trans_con_handle, ATT_CHARACTERISTIC_ae02_01_VALUE_HANDLE, packet, 7, 0);
+        int ret = ble_comm_att_send_data(trans_con_handle, ATT_CHARACTERISTIC_ae02_01_VALUE_HANDLE, packet, packLen, 0);
     }
 }
 #endif // ADC
@@ -379,10 +380,11 @@ void app_main()
 #endif // UART
 
 #if ADC
+#define sampleMS 1000
     initUSB_ADC();
-    adc_add_sample_ch(AD_CH_DM0);adc_set_sample_freq(AD_CH_DM0, 100);
-    adc_add_sample_ch(AD_CH_DP0);adc_set_sample_freq(AD_CH_DP0, 100);
-    u16 timerID = sys_timer_add(NULL, readWindADC, 100); // 10Hz
+    adc_add_sample_ch(AD_CH_DM0);adc_set_sample_freq(AD_CH_DM0, sampleMS);
+    adc_add_sample_ch(AD_CH_DP0);adc_set_sample_freq(AD_CH_DP0, sampleMS);
+    u16 timerID = sys_timer_add(NULL, readWindADC, sampleMS); // 1Hz
 
 #endif // ADC
 
